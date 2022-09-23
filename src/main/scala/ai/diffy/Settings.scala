@@ -20,6 +20,7 @@ class Settings(
      @Value("${allowHttpSideEffects:false}") val allowHttpSideEffects: Boolean = false,
      @Value("${excludeHttpHeadersComparison:false}") val excludeHttpHeadersComparison: Boolean = false,
      @Value("${resource.mapping:}") resourceMappings: String = "",
+     @Value("${supportGraphql:false}") val supportGraphql: Boolean = false,
      @Value("${responseMode:primary}") mode: String = ServiceInstance.Primary.name)
 {
   private[this] val log = LoggerFactory.getLogger(classOf[Settings])

@@ -4,22 +4,24 @@ import ai.diffy.Settings;
 import ai.diffy.analysis.*;
 import ai.diffy.lifter.HttpLifter;
 import ai.diffy.lifter.Message;
+import io.netty.buffer.Unpooled;
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpMethod;
+
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
+import reactor.netty.ByteBufFlux;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
 
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -73,52 +75,131 @@ public class ReactorHttpDifferenceProxy {
         }
     }
     private Publisher<Void> selectHandler(HttpServerRequest req, HttpServerResponse res) {
-        if(!settings.allowHttpSideEffects() && methodsWithSideEffects.contains(req.method())){
-            log.info("Ignoring {} request for safety. Use --allowHttpSideEffects=true to turn safety off.", req.method());
-            return res.send();
-        }
-        CompletableFuture<HttpRequest> request = new CompletableFuture<>();
-        req.receive().aggregate().asString().toFuture().thenAccept(body -> {
-            request.complete(new HttpRequest(
-                    req.method().name(),
-                    req.uri(),
-                    req.path(),
-                    req.params(),
-                    new HttpMessage(req.requestHeaders(), body)
-            ));
-        });
+        log.debug("request: {}", req);
+//        CompletableFuture<HttpRequest> request = new CompletableFuture<>();
+//        req.receive().aggregate().asString().toFuture().thenAccept(body -> {
+//            request.complete(new HttpRequest(
+//                    req.method(),
+//                    req.uri(),
+//                    req.path(),
+//                    req.params(),
+//                    new HttpMessage(req.requestHeaders(), body)
+//            ));
+//        });
 
-        CompletableFuture<HttpResponse>[] messages = new CompletableFuture[]{
-            new CompletableFuture<>(),
-            new CompletableFuture<>(),
-            new CompletableFuture<>()
-        };
+//        CompletableFuture<HttpResponse>[] messages = new CompletableFuture[]{
+//            new CompletableFuture<>(),
+//            new CompletableFuture<>(),
+//            new CompletableFuture<>()
+//        };
 
-        receive(primary, req).thenAccept(messages[0]::complete);
-        messages[0].thenAccept(done -> { receive(candidate, req).thenAccept(messages[1]::complete);});
-        messages[1].thenAccept(done -> { receive(secondary, req).thenAccept(messages[2]::complete);});
-        messages[2].thenAccept(done -> {
-            try {
-                Message r = lifter.liftRequest(request.get());
-                Message c = lifter.liftResponse(messages[1].get());
-                Message p = lifter.liftResponse(messages[0].get());
-                Message s = lifter.liftResponse(messages[2].get());
-                analyzer.apply(r, c, p, s);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            } catch (ExecutionException e) {
-                e.printStackTrace();
+        Mono<Void> ret = req.receive().aggregate().asString().map(
+            body -> new HttpRequest(req.method(), req.uri(), req.path(), req.params(), new HttpMessage(req.requestHeaders(), body))
+        ).flatMap(httpRequest -> {
+            log.debug("request: {} {}", httpRequest.getPath(), httpRequest.getMessage().getBody());
+            if (httpRequest.getPath().contains("health")) {
+                return res.send();
+            }
+            if (isRequestAllowed(httpRequest)) {
+
+                CompletableFuture<HttpResponse>[] messages = new CompletableFuture[]{
+                    new CompletableFuture<>(),
+                    new CompletableFuture<>(),
+                    new CompletableFuture<>()
+                };
+                receive(primary.headers(h -> h.set(req.requestHeaders())), req, httpRequest.getMessage().getBody()).thenAccept(messages[0]::complete);
+                messages[0].thenAccept(done -> { receive(candidate.headers(h -> h.set(req.requestHeaders())), req, httpRequest.getMessage().getBody()).thenAccept(messages[1]::complete);});
+                messages[1].thenAccept(done -> { receive(secondary.headers(h -> h.set(req.requestHeaders())), req, httpRequest.getMessage().getBody()).thenAccept(messages[2]::complete);});
+                messages[2].thenAccept(done -> {
+                    try {
+                        Message r = lifter.liftRequest(httpRequest);
+                        Message c = lifter.liftResponse(messages[1].get());
+                        Message p = lifter.liftResponse(messages[0].get());
+                        Message s = lifter.liftResponse(messages[2].get());
+                        analyzer.apply(r, c, p, s);
+                    } catch (InterruptedException | ExecutionException e) {
+                        e.printStackTrace();
+                    }
+                });
+                return Mono.fromFuture(messages[responseIndex])
+                    .flatMap(r -> res.headers(r.getMessage().headers).sendString(Mono.just(r.getMessage().body)).then());
+            } else {
+                log.info("Ignoring {} request for safety. Use --allowHttpSideEffects=true to turn safety off.", req.method());
+                return res.send();
             }
         });
 
-        return Mono.fromFuture(messages[responseIndex])
-                .flatMap(r -> res.headers(r.getMessage().headers).sendString(Mono.just(r.getMessage().body)).then());
+        return ret;
+
+//        CompletableFuture<Void> ret = request.thenAccept(httpRequest -> {
+//            log.debug("request: {} {}", httpRequest.getPath(), httpRequest.getMessage().getBody());
+//            if (isRequestAllowed(httpRequest)) {
+//                receive(primary, req).thenAccept(messages[0]::complete);
+//                messages[0].thenAccept(done -> { receive(candidate, req).thenAccept(messages[1]::complete);});
+//                messages[1].thenAccept(done -> { receive(secondary, req).thenAccept(messages[2]::complete);});
+//                messages[2].thenAccept(done -> {
+//                    try {
+//                        Message r = lifter.liftRequest(request.get());
+//                        Message c = lifter.liftResponse(messages[1].get());
+//                        Message p = lifter.liftResponse(messages[0].get());
+//                        Message s = lifter.liftResponse(messages[2].get());
+//                        analyzer.apply(r, c, p, s);
+//                    } catch (InterruptedException e) {
+//                        e.printStackTrace();
+//                    } catch (ExecutionException e) {
+//                        e.printStackTrace();
+//                    }
+//                });
+//                Mono.fromFuture(messages[responseIndex])
+//                    .flatMap(r -> res.headers(r.getMessage().headers).sendString(Mono.just(r.getMessage().body)).then());
+//            } else {
+//                log.info("Ignoring {} request for safety. Use --allowHttpSideEffects=true to turn safety off.", req.method());
+//                res.send();
+//            }
+//        });
+//
+//        return Mono.fromFuture(ret);
+
+//        receive(primary, req).thenAccept(messages[0]::complete);
+//        messages[0].thenAccept(done -> { receive(candidate, req).thenAccept(messages[1]::complete);});
+//        messages[1].thenAccept(done -> { receive(secondary, req).thenAccept(messages[2]::complete);});
+//        messages[2].thenAccept(done -> {
+//            try {
+//                Message r = lifter.liftRequest(request.get());
+//                Message c = lifter.liftResponse(messages[1].get());
+//                Message p = lifter.liftResponse(messages[0].get());
+//                Message s = lifter.liftResponse(messages[2].get());
+//                analyzer.apply(r, c, p, s);
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            } catch (ExecutionException e) {
+//                e.printStackTrace();
+//            }
+//        });
+//
+//        return Mono.fromFuture(messages[responseIndex])
+//                .flatMap(r -> res.headers(r.getMessage().headers).sendString(Mono.just(r.getMessage().body)).then());
     }
 
-    private Mono<HttpResponse> receiveMono(HttpClient client, HttpServerRequest req) {
+    private boolean isRequestAllowed(HttpRequest req) {
+        if (settings.allowHttpSideEffects())
+            return true;
+        if (settings.supportGraphql() && req.getGraphqlData().isPresent()) 
+            return req.getGraphqlData().get().getMethod() == GraphqlMethod.Query;
+        return !methodsWithSideEffects.contains(req.getMethod());
+    }
+
+    private Mono<HttpResponse> receiveMono(HttpClient client, HttpServerRequest req, String requestBody) {
+        log.debug("request method {}", req.method());
+        log.debug("request uri {}", req.uri());
+        log.debug("request body {}", requestBody);
+        log.debug("request headers {}", req.requestHeaders());
+        // HttpClient client1 = client.headers(h -> h.set(req.requestHeaders()));
+        // HttpClient client1 = client.headers(h -> h.set(HttpHeaderNames.CONTENT_TYPE, "application/json"));
         return client.request(req.method())
                 .uri(req.uri())
-                .send(req.receive().retain())
+                // .send(req.receive().retain())
+                .send(ByteBufFlux.fromString(Mono.just(requestBody)))
                 .responseSingle(
                         (headers, body) ->
                                 body.asString()
@@ -127,10 +208,10 @@ public class ReactorHttpDifferenceProxy {
                 );
     }
     private ForkJoinPool pool = ForkJoinPool.commonPool();
-    private CompletableFuture<HttpResponse> receive(HttpClient client, HttpServerRequest req) {
+    private CompletableFuture<HttpResponse> receive(HttpClient client, HttpServerRequest req, String body) {
         CompletableFuture<HttpResponse> result = new CompletableFuture<>();
         pool.execute(() -> {
-            result.complete(receiveMono(client, req).block());
+            result.complete(receiveMono(client, req, body).block());
         });
         return result;
     }
