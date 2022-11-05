@@ -4,6 +4,7 @@ import ai.diffy.Settings;
 import ai.diffy.analysis.*;
 import ai.diffy.lifter.HttpLifter;
 import ai.diffy.lifter.Message;
+import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.HttpMethod;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
@@ -16,6 +17,7 @@ import reactor.netty.http.client.HttpClient;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
+import scala.Int;
 
 import java.util.Date;
 import java.util.HashSet;
@@ -72,6 +74,17 @@ public class ReactorHttpDifferenceProxy {
             default: responseIndex = 0;
         }
     }
+
+    private HttpRequest getR(CompletableFuture<HttpRequest> request) {
+       HttpRequest r = null;
+       try {
+           r = request.get();
+       } catch (InterruptedException | ExecutionException e) {
+           log.debug("fail request get");
+       }
+       return r;
+    }
+
     private Publisher<Void> selectHandler(HttpServerRequest req, HttpServerResponse res) {
         if(!settings.allowHttpSideEffects() && methodsWithSideEffects.contains(req.method())){
             log.info("Ignoring {} request for safety. Use --allowHttpSideEffects=true to turn safety off.", req.method());
@@ -94,9 +107,9 @@ public class ReactorHttpDifferenceProxy {
             new CompletableFuture<>()
         };
 
-        receive(primary, req).thenAccept(messages[0]::complete);
-        messages[0].thenAccept(done -> { receive(candidate, req).thenAccept(messages[1]::complete);});
-        messages[1].thenAccept(done -> { receive(secondary, req).thenAccept(messages[2]::complete);});
+        receive(primary, req, getR(request)).thenAccept(messages[0]::complete);
+        messages[0].thenAccept(done -> { receive(candidate, req, getR(request)).thenAccept(messages[1]::complete);});
+        messages[1].thenAccept(done -> { receive(secondary, req, getR(request)).thenAccept(messages[2]::complete);});
         messages[2].thenAccept(done -> {
             try {
                 Message r = lifter.liftRequest(request.get());
@@ -115,10 +128,11 @@ public class ReactorHttpDifferenceProxy {
                 .flatMap(r -> res.headers(r.getMessage().headers).sendString(Mono.just(r.getMessage().body)).then());
     }
 
-    private Mono<HttpResponse> receiveMono(HttpClient client, HttpServerRequest req) {
+    private Mono<HttpResponse> receiveMono(HttpClient client, HttpServerRequest req, HttpRequest r) {
         return client.request(req.method())
                 .uri(req.uri())
-                .send(req.receive().retain())
+                //.send(req.receive().retain())
+                .send(Mono.just(Unpooled.wrappedBuffer(r.getMessage().getBody().getBytes())))
                 .responseSingle(
                         (headers, body) ->
                                 body.asString()
@@ -127,10 +141,10 @@ public class ReactorHttpDifferenceProxy {
                 );
     }
     private ForkJoinPool pool = ForkJoinPool.commonPool();
-    private CompletableFuture<HttpResponse> receive(HttpClient client, HttpServerRequest req) {
+    private CompletableFuture<HttpResponse> receive(HttpClient client, HttpServerRequest req, HttpRequest r) {
         CompletableFuture<HttpResponse> result = new CompletableFuture<>();
         pool.execute(() -> {
-            result.complete(receiveMono(client, req).block());
+            result.complete(receiveMono(client, req, r).block());
         });
         return result;
     }
