@@ -13,4 +13,8 @@ lib_managed/
 .DS_Store
 .ensime
 .ivyjars
+.bloop
+.metals
+.vscode
+.local
 example/ai/diffy/examples/http/
